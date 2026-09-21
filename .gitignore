@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+*.log
+
+# 本地测试配置与运行日志
+.devhome/
+logs/
+
+# 开发辅助脚本
+.write-helper.ps1

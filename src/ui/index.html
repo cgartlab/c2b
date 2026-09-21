@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>摄像头壁纸 · 设置</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="stateDot"></span>
+      <span class="state-label" id="stateLabel">未启动</span>
+    </div>
+    <div class="actions">
+      <button id="btnRestart" class="btn btn-primary">重启</button>
+      <button id="btnStop" class="btn btn-danger">停止</button>
+    </div>
+  </header>
+
+  <!-- 精简状态条：只显示关键三项 -->
+  <section class="statusbar">
+    <div class="stat"><label>摄像头</label><span id="statDevice">—</span></div>
+    <div class="stat"><label>编码器</label><span id="statEncoder">—</span></div>
+    <div class="stat"><label>运行</label><span id="statUptime">—</span></div>
+  </section>
+
+  <!-- 录制控制条 -->
+  <section class="rec-bar">
+    <div class="rec-status" id="recStatus">
+      <span class="rec-dot" id="recDot"></span>
+      <span id="recLabel">未录制</span>
+    </div>
+    <button id="btnRecord" class="btn btn-rec">开始录制</button>
+    <span class="rec-time" id="recTime">00:00</span>
+  </section>
+
+  <!-- 主控件区：单栏，自动生成 -->
+  <main class="panels" id="panels"></main>
+
+  <!-- 高级区：可折叠，默认收起 -->
+  <section class="advanced">
+    <button class="adv-toggle" id="advToggle">高级 ▸</button>
+    <div class="adv-content" id="advContent" hidden>
+      <div class="adv-status">
+        <div class="stat"><label>输出</label><span id="statOutput">—</span></div>
+        <div class="stat"><label>GPU</label><span id="statHw">—</span></div>
+        <div class="stat"><label>PID</label><span id="statPid">—</span></div>
+      </div>
+      <div class="adv-status">
+        <div class="stat"><label>运行 ID</label><span id="statRunId">—</span></div>
+        <div class="stat"><label>日志目录</label><span id="statLogsDir" title="—">—</span></div>
+      </div>
+      <div class="adv-section">
+        <h3>滤镜链</h3>
+        <pre class="preview" id="filterChain">—</pre>
+      </div>
+      <div class="adv-section">
+        <h3>运行日志</h3>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span id="saveHint">改动会实时生效</span>
+    <span class="muted" id="connHint">连接中…</span>
+  </footer>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>
