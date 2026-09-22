@@ -1,7 +1,9 @@
-# cam-to-bg — 把摄像头画面变成 Windows 桌面壁纸
+# C2B (Cam To Background) — 把摄像头画面变成 Windows 桌面壁纸
 
 用 Node.js 把摄像头实时画面作为桌面背景（在桌面图标**之下**），
 全程走 GPU 硬件加速，并提供一个本地设置界面，可随时调整色彩、曝光、帧率、码率等参数。
+
+> **C2B = Cam To Background**。项目同时提供屏幕录制功能。
 
 ---
 

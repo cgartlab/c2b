@@ -1,9 +1,9 @@
 {
-  "name": "cam-to-bg",
+  "name": "c2b",
   "version": "1.0.0",
-  "description": "把摄像头实时画面作为 Windows 桌面背景，GPU 硬件加速，带设置界面",
+  "description": "C2B (Cam To Background) — 把摄像头实时画面作为 Windows 桌面背景，GPU 硬件加速，带设置界面与屏幕录制",
   "type": "module",
-  "bin": { "cam-to-bg": "src/cli.js" },
+  "bin": { "c2b": "src/cli.js" },
   "main": "src/index.js",
   "scripts": {
     "start": "node src/cli.js start",
