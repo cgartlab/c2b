@@ -60,12 +60,19 @@ export function findFreePort(preferred = 0) {
 }
 
 export class Pipeline extends EventEmitter {
-  constructor({ ffmpegPath, config, encoder, deviceName, target, cmdFileName, cmdDir, runDir = null }) {
+  /**
+   * @param {object} opts
+   * @param {string} opts.deviceName 喂给 dshow 的**打开标识**（重名设备时为备用名）
+   * @param {string} [opts.deviceLabel] 界面显示名（错误提示用；缺省回退 deviceName）
+   */
+  constructor({ ffmpegPath, config, encoder, deviceName, deviceLabel, target, cmdFileName, cmdDir, runDir = null }) {
     super();
     this.ffmpegPath = ffmpegPath;
     this.config = config;
     this.encoder = encoder;
     this.deviceName = deviceName;
+    /** 展示用设备名（重名设备的打开标识是一长串 @device_pnp_…，不适合给人看） */
+    this.deviceLabel = deviceLabel || deviceName;
     this.target = target;
     /**
      * sendcmd 命令文件的文件名（不含目录）与所在目录。
@@ -83,7 +90,9 @@ export class Pipeline extends EventEmitter {
     this.logPath = makeLogPath('ffmpeg', runDir);
     this.startedAt = null;
     this.lastError = null;
-    this._stopping = false;
+    this._stopping = false;      // 收尾在途（诊断用）
+    this._stopRequested = false; // 停止请求闩锁：供退出分类，不随收尾复位
+    this._stopPromise = null;    // 并发 stop 共享同一收尾
   }
 
   get running() {
@@ -97,6 +106,13 @@ export class Pipeline extends EventEmitter {
 
   /**
    * 启动管线。会先绑定端口，确保 mpv 能连上。
+   *
+   * 刻意**不**与 mpv 并行拉起（曾评估并否决，实测依据）：
+   *   · "连上再销毁"的就绪探测会让 ffmpeg 立刻 -10053 断流暴毙（实测复现）；
+   *   · 只读探测（Get-NetTCPConnection）在受限环境查不到监听（实测恒 0）；
+   *   · mpv 无开流重试选项（--list-options 实查），探测失败=客户端永远连不上，
+   *     引擎却报 running——静默死流，比省下的 ~0.5s 严重得多。
+   * 现有顺序（700ms 自检 → 起 mpv → 连接）实测窗口已很小、稳态零丢帧。
    */
   async start() {
     if (this.running) return { port: this.port };
@@ -134,15 +150,7 @@ export class Pipeline extends EventEmitter {
       }));
     });
 
-    child.on('exit', (code) => {
-      const wasStopping = this._stopping;
-      this.child = null;
-      if (!wasStopping) {
-        const tail = readLogTail(this.logPath, 1500);
-        this.lastError = `ffmpeg 异常退出 (code=${code})`;
-        this.emit('exit', { code, logTail: tail });
-      }
-    });
+    child.on('exit', (code) => this._classifyExit(code));
 
     // 给 ffmpeg 一点时间建立 TCP 监听
     await new Promise((r) => setTimeout(r, 700));
@@ -176,16 +184,16 @@ export class Pipeline extends EventEmitter {
     // BindToObject 失败：既可能是被占用，也可能是权限不足，需要进一步区分
     if (/BindToObject|Could not find video device|I\/O error/i.test(t)) {
       if (/Device or resource busy|in use/i.test(t)) {
-        return `摄像头「${this.deviceName}」正被其他程序独占。请关闭可能在使用摄像头的程序（浏览器、会议软件、直播工具等）后重试。`;
+        return `摄像头「${this.deviceLabel}」正被其他程序独占。请关闭可能在使用摄像头的程序（浏览器、会议软件、直播工具等）后重试。`;
       }
-      return `摄像头「${this.deviceName}」无法打开。系统能枚举到该设备，但当前进程无法绑定它。常见原因有两种：\n`
+      return `摄像头「${this.deviceLabel}」无法打开。系统能枚举到该设备，但当前进程无法绑定它。常见原因有两种：\n`
         + '        1) 权限不足 —— 某些摄像头需要管理员权限才能访问。'
         + '可尝试以管理员身份重新启动本工具；也可先在「相机」App 里确认设备本身正常。\n'
         + '        2) 设备被占用 —— 关闭可能正在使用摄像头的程序后重试。\n'
         + '        若两种都不奏效，可改用 OBS 虚拟摄像头中转（UGREEN → OBS → 虚拟摄像头）。';
     }
     if (/Device or resource busy|in use/i.test(t)) {
-      return `摄像头「${this.deviceName}」正被其他程序独占，请关闭后重试。`;
+      return `摄像头「${this.deviceLabel}」正被其他程序独占，请关闭后重试。`;
     }
     if (/Cannot load|Unknown encoder|error initializing/i.test(t) && /amf|nvenc|qsv|mf/i.test(t)) {
       return `硬件编码器 ${this.encoder.name} 初始化失败，可能是显卡驱动问题。可改用 libx264（软件编码）。`;
@@ -209,8 +217,38 @@ export class Pipeline extends EventEmitter {
    * 继续占用摄像头，导致后续启动全部失败（BindToObject）。
    * 因此这里补上 taskkill /T /F 兜底。
    */
-  async stop() {
-    if (!this.child) return;
+  /**
+   * 退出分类（供 exit 处理器与测试直调）。
+   *
+   * 必须用**闩锁 `_stopRequested`** 而非在途 `_stopping`：stop 的超时路径
+   * 会先把 `_stopping` 复位、再 taskkill——exit 事件在复位**之后**到达，
+   * 用在途标志会把"手动停止"误判成崩溃 → `_onPipelineCrash` 在干净停止/
+   * 重启中打出"ffmpeg 异常退出"并写 lastError（状态诚实家族回归）。
+   */
+  _classifyExit(code) {
+    const wasStopping = this._stopRequested;
+    this.child = null;
+    if (!wasStopping) {
+      const tail = readLogTail(this.logPath, 1500);
+      this.lastError = `ffmpeg 异常退出 (code=${code})`;
+      this.emit('exit', { code, logTail: tail });
+    }
+  }
+
+  /**
+   * 非 async 方法：async 每次调用都包一层新 promise，破坏"并发 stop 共享
+   * 同一收尾"的可观察契约（第二个调用方会提前返回、不等收尾就继续）。
+   * @returns {Promise<void>} 并发调用共享同一收尾 promise
+   */
+  stop() {
+    if (this._stopPromise) return this._stopPromise;
+    if (!this.child) return Promise.resolve();
+    this._stopPromise = this._stopCore();
+    return this._stopPromise;
+  }
+
+  async _stopCore() {
+    this._stopRequested = true; // 闩锁：此后任何退出都归类为"停止引发"
     this._stopping = true;
     const child = this.child;
     this.child = null;
@@ -239,7 +277,15 @@ export class Pipeline extends EventEmitter {
   }
 }
 
-/** 探测某端口是否已有 ffmpeg 在监听（供 mpv 连接前确认）。 */
+/**
+ * 探测某端口是否已有 ffmpeg 在监听（供 mpv 连接前确认）。
+ *
+ * ⚠️ **禁止对本项目的 ffmpeg 输出流使用"连接即销毁"式探测**：
+ * ffmpeg 的 tcp listen 输出流被短暂连接后断开，下一次写入即报
+ * -10053/-10054 **致命错误直接退出**（真机实测复现）。客户端必须是
+ * "连上就一直读"的 mpv 本尊。就绪检测请用无副作用的方式
+ *（只读查询在受限环境不可靠，见 pipeline.start 的评估注释）。
+ */
 export function waitForPort(port, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve) => {

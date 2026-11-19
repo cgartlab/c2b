@@ -35,7 +35,10 @@ export function shouldLog(level, threshold = 'info') {
  * @param {string} [opts.module='app'] 默认模块标签
  */
 export function createLogger(opts = {}) {
-  const { logPath = null, level = 'info', console: toConsole = false, module: defaultModule = 'app' } = opts;
+  const { logPath = null, console: toConsole = false, module: defaultModule = 'app' } = opts;
+  // level 必须可变：配置里的 logLevel 变更要**即时生效**（setLevel），
+  // 历史实现是常量闭包，改级别只能靠重启整个应用（且连重启按钮都不重建 logger）
+  let level = opts.level || 'info';
 
   let buffer = '';
   let logFd = null;
@@ -142,6 +145,15 @@ export function createLogger(opts = {}) {
     },
     close,
     getLastError,
+    /**
+     * 运行期切换日志级别（logLevel 配置即时生效的机制）。
+     * @param {string} next 合法级别；非法值拒绝并保持原级别
+     * @returns {string} 生效后的级别
+     */
+    setLevel(next) {
+      if (Object.prototype.hasOwnProperty.call(LOG_LEVELS, next)) level = next;
+      return level;
+    },
     get level() { return level; },
     get path() { return logPath; },
   };

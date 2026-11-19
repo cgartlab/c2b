@@ -53,6 +53,9 @@ Add-Type -Namespace CamToBg -Name Native -MemberDefinition @"
   public static extern System.IntPtr FindWindowEx(System.IntPtr parent, System.IntPtr childAfter, string className, string windowTitle);
 
   [DllImport("user32.dll", SetLastError=true)]
+  public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint lpdwProcessId);
+
+  [DllImport("user32.dll", SetLastError=true)]
   public static extern System.IntPtr SetParent(System.IntPtr hWndChild, System.IntPtr hWndNewParent);
 
   [DllImport("user32.dll", SetLastError=true)]
@@ -377,6 +380,39 @@ try {
         if ($sb.ToString() -eq $Title) { $found = $h; break }
       }
       Write-Json ([pscustomobject]@{ ok = $true; hwnd = [int64]$found; found = ($found -ne [System.IntPtr]::Zero) })
+    }
+
+    "closewindows" {
+      <#
+        强杀所有标题精确匹配的窗口及其进程。
+        用途：重启/停止后清扫残留的 mpv 窗口。
+        背景：mpv 若通过 mpv.com 启动器拉起，SIGTERM 只会杀死启动器，
+        真正的 mpv.exe 变成孤儿继续持有窗口——表现为"桌面上遗留一个暂停的播放器"。
+        按窗口标题找进程不依赖父子进程关系，孤儿也能被清掉。
+      #>
+      if (-not $Title -or $Title.Length -eq 0) { throw "closewindows 需要 -Title 参数" }
+      $targetPids = @{}
+      $cb = [CamToBg.Native+EnumWindowsProc]{
+        param([System.IntPtr]$h, [System.IntPtr]$l)
+        $sb = New-Object System.Text.StringBuilder 512
+        [void][CamToBg.Native]::GetWindowText($h, $sb, 512)
+        if ($sb.ToString() -eq $Title) {
+          $procId = [uint32]0
+          [void][CamToBg.Native]::GetWindowThreadProcessId($h, [ref]$procId)
+          if ($procId -gt 0) { $targetPids[$procId] = $true }
+        }
+        return $true
+      }
+      [void][CamToBg.Native]::EnumWindows($cb, [System.IntPtr]::Zero)
+
+      $killed = @()
+      foreach ($procId in @($targetPids.Keys)) {
+        try {
+          Stop-Process -Id $procId -Force -ErrorAction Stop
+          $killed += [int]$procId
+        } catch { /* 进程可能已自行退出 */ }
+      }
+      Write-Json ([pscustomobject]@{ ok = $true; matched = @($targetPids.Keys).Count; killed = $killed })
     }
 
     "windowinfo" {

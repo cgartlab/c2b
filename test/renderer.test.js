@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMpvArgs, latencyArgs } from '../src/renderer.js';
+import { buildMpvArgs, latencyArgs, Renderer } from '../src/renderer.js';
 
 const BASE = {
   hwnd: 0,
@@ -39,6 +39,31 @@ test('smooth 模式保留缓冲并禁止丢帧', () => {
   const args = latencyArgs('smooth');
   assert.ok(args.includes('--cache=yes'), '应启用缓存');
   assert.ok(args.includes('--framedrop=no'), '应禁止丢帧');
+});
+
+/* ── 退出分类闩锁（与 Pipeline 同构：stop 超时路径复位 _stopping 后
+      exit 晚到，曾把手动停止误判成 mpv 崩溃 → _onRendererCrash 假告警） ── */
+test('退出分类：意外退出外抛、停止引发的退出被闩锁抑制', () => {
+  const r = new Renderer({ mpvPath: 'mpv.exe', streamUrl: 'tcp://127.0.0.1:1', config: {}, runDir: null });
+  let got = 0;
+  r.on('exit', () => { got += 1; });
+
+  r._classifyExit(1);
+  assert.equal(got, 1, '意外退出必须外抛崩溃事件（引擎状态诚实依赖它）');
+  assert.equal(r.child, null);
+
+  r._stopRequested = true; // 等价于 stop() 已发起
+  r._classifyExit(1);
+  assert.equal(got, 1, '停止引发的退出不得再次外抛（假告警回归）');
+});
+
+test('smooth 不用音频时钟：本流是 --no-audio 纯视频（官方 audio 模式依赖音频时钟）', () => {
+  const args = latencyArgs('smooth');
+  assert.ok(args.includes('--video-sync=display-resample'),
+    '应使用以显示时钟为基准的 display-resample');
+  assert.ok(!args.some((a) => a.startsWith('--video-sync=audio')),
+    'video-sync=audio 在无音频流上会让画面追一个不存在的参考（实测持续缓冲）');
+  assert.ok(args.includes('--untimed=no'), 'display-resample 需要正常计时');
 });
 
 test('三种模式的缓冲上限逐级增大', () => {
@@ -99,4 +124,17 @@ test('提供 ipcPath 时注入 --input-ipc-server', () => {
 
 test('忽略用户 mpv 配置以保证行为可预测', () => {
   assert.ok(buildMpvArgs(BASE).includes('--no-config'));
+});
+
+test('注入 --log-file（--no-terminal 下 mpv.log 历史为空，出问题无从诊断）', () => {
+  const args = buildMpvArgs({ ...BASE, logFile: 'C:/logs/mpv.log' });
+  assert.ok(args.includes('--log-file=C:/logs/mpv.log'));
+  assert.ok(!buildMpvArgs(BASE).some((a) => a.startsWith('--log-file=')), '未提供路径时不注入');
+});
+
+test('不再带 --loop-file=inf：断流重连的 RST 会让 ffmpeg -10054 致命退出（真机日志实证）', () => {
+  const args = buildMpvArgs(BASE);
+  assert.ok(!args.includes('--loop-file=inf'),
+    '流断=ffmpeg 已死，状态机已转 error；mpv 靠 --idle 停在末帧即可');
+  assert.ok(args.includes('--idle=yes'), 'idle 承担断流后的存活职责');
 });

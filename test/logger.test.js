@@ -26,6 +26,30 @@ test('级别过滤：低于生效级别的不输出', () => {
   assert.deepEqual(levels, ['warn', 'error'], 'warn 级别下只应有 warn 与 error');
 });
 
+test('setLevel 运行期切换级别（logLevel 配置即时生效的机制）', () => {
+  const dir = tmpDir();
+  const file = path.join(dir, 'run.jsonl');
+  const log = createLogger({ logPath: file, level: 'warn' });
+  log.info('切换前-应被过滤');
+  assert.equal(log.level, 'warn');
+  assert.equal(log.setLevel('debug'), 'debug', '合法级别应生效并返回新值');
+  log.debug('切换后-应写入');
+  log.close();
+  const txt = readFileSync(file, 'utf8');
+  assert.ok(!txt.includes('切换前-应被过滤'), '切换前的低级别消息不得出现');
+  assert.ok(txt.includes('切换后-应写入'), '切换后的 debug 消息必须写入');
+});
+
+test('setLevel 拒绝非法值（保持原级别）', () => {
+  const dir = tmpDir();
+  const file = path.join(dir, 'run.jsonl');
+  const log = createLogger({ logPath: file, level: 'info' });
+  assert.equal(log.setLevel('nope'), 'info', '非法值不得改变级别');
+  assert.equal(log.setLevel(undefined), 'info');
+  assert.equal(log.level, 'info');
+  log.close();
+});
+
 test('shouldLog 边界', () => {
   assert.ok(shouldLog('error', 'info'));
   assert.ok(shouldLog('warn', 'info'));

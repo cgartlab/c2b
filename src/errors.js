@@ -25,4 +25,6 @@ export const ErrorCodes = {
   DESKTOP_ATTACH_FAILED: 'EDESKTOP',
   CONFIG_INVALID: 'ECONFIG',
   NOT_WINDOWS: 'EPLATFORM',
+  /** 并发操作冲突：启动/重启流程进行中又收到 start/restart */
+  BUSY: 'EBUSY',
 };
