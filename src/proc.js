@@ -106,35 +106,93 @@ export function runCaptured(command, args, options = {}) {
   });
 }
 
+/** 单个日志文件的大小上限：超过则把旧内容挪到 `<path>.old`（仅保留一份）。 */
+const LOG_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * 打开日志前做体积轮转。
+ *
+ * 历史缺陷：CLI 录制不带 runDir，日志落到固定路径 `cam-to-bg-recorder.log`
+ * 且**永远追加**——每次录制都往上叠，长期使用会无限膨胀吃满磁盘。
+ * 这里统一在打开前兜底：超过 4MB 就把旧文件改名为 `.old`（覆盖上一份），
+ * 有界即安全（上限 2×4MB）。
+ *
+ * @param {string} logPath
+ * @param {number} [maxBytes]
+ * @returns {boolean} 是否发生了轮转
+ */
+export function rotateLogIfNeeded(logPath, maxBytes = LOG_MAX_BYTES) {
+  try {
+    if (!logPath || !fs.existsSync(logPath)) return false;
+    if (fs.statSync(logPath).size < maxBytes) return false;
+    fs.renameSync(logPath, `${logPath}.old`);
+    return true;
+  } catch {
+    return false; // 轮转失败不阻塞启动（日志只是少了上限保证）
+  }
+}
+
 /**
  * 启动一个长期运行的子进程（ffmpeg / mpv）。
  *
  * 输出默认被重定向到日志文件，既避免管道限制，
  * 也便于在调试时查看编码器/解码器报错。
  *
+ * stdinPipe=true 时优先以管道接 stdin（供录制进程接收 'q' 优雅退出）；
+ * 受限沙箱会对**任何**管道 stdio 直接抛 EPERM（实测），
+ * 此时自动回退为无管道模式——录制仍可工作，只是失去优雅退出通道
+ * （分片 MP4 已保证强杀后文件可播，优雅收尾只是"锦上添花"）。
+ *
  * @param {string} command
  * @param {string[]} args
  * @param {object} [options]
  * @param {string} [options.logPath] 日志文件路径
  * @param {string} [options.cwd]
+ * @param {boolean} [options.stdinPipe=false] 以管道接 stdin
  * @returns {{child: import('node:child_process').ChildProcess, logPath: string|null}}
  */
 export function spawnLongRunning(command, args, options = {}) {
-  const { logPath = null, cwd } = options;
+  const { logPath = null, cwd, stdinPipe = false } = options;
+  if (logPath) rotateLogIfNeeded(logPath); // 打开前轮转，防止无限追加
+  const fd = logPath ? fs.openSync(logPath, 'a') : null;
 
-  let stdio;
-  if (logPath) {
-    // 日志文件用追加模式，保留上一次崩溃的现场
-    const fd = fs.openSync(logPath, 'a');
-    stdio = ['ignore', fd, fd];
+  const spawnWith = (stdio) => {
     const child = spawn(command, args, { stdio, windowsHide: true, cwd });
-    // 父进程可以立刻关掉自己的 fd 副本，子进程仍持有
-    child.once('spawn', () => { try { fs.closeSync(fd); } catch { /* 忽略 */ } });
-    return { child, logPath };
+    // 立即关父进程副本（与 runCaptured 同款）：子进程在 spawn() 内已同步继承句柄。
+    // 历史缺陷：once('spawn') 才关 —— spawn **异步失败**（只发 'error' 不发
+    // 'spawn'，如命令随后被删/权限变化）时关闭回调永不触发 → 父进程 fd 永久泄漏，
+    // 每次失败漏一个，长期运行可耗尽句柄。
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* 忽略 */ } }
+    return child;
+  };
+
+  const base = fd !== null ? fd : 'ignore';
+
+  if (stdinPipe) {
+    try {
+      const stdio = ['pipe', fd !== null ? fd : 'ignore', fd !== null ? fd : 'ignore'];
+      const child = spawnWith(stdio);
+      // 吞掉 stdin 的异步 EPIPE：目标进程可能恰在写 'q' 的同时退出
+      //（-t 到点、ffmpeg/mpv 崩溃与停止操作的竞态窗口），流会在 write 之后
+      // 异步报 'error'——无监听器的流 error = uncaughtException = 整个应用退出
+      if (child.stdin) child.stdin.on('error', () => {});
+      return { child, logPath };
+    } catch (err) {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* 忽略 */ } }
+      if (!err || (err.code !== 'EPERM' && err.code !== 'EACCES')) throw err;
+      // 沙箱限制：落到无管道模式，fd 需要重新打开（上面可能已关）
+      const retryFd = logPath ? fs.openSync(logPath, 'a') : null;
+      const child = spawn(command, args, {
+        stdio: ['ignore', retryFd !== null ? retryFd : 'ignore', retryFd !== null ? retryFd : 'ignore'],
+        windowsHide: true, cwd,
+      });
+      if (retryFd !== null) { try { fs.closeSync(retryFd); } catch { /* 忽略 */ } }
+      return { child, logPath };
+    }
   }
 
-  const child = spawn(command, args, { stdio: 'ignore', windowsHide: true, cwd });
-  return { child, logPath: null };
+  if (logPath) return { child: spawnWith([base, base, base]), logPath };
+  return { child: spawnWith(['ignore', 'ignore', 'ignore']), logPath: null };
 }
 
 /** 读取文件尾部若干字节，用于展示日志。 */

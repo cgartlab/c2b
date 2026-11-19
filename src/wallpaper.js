@@ -12,13 +12,85 @@
 import { EventEmitter } from 'node:events';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import { probeDesktop, attachToDesktop, detachFromDesktop } from './win32.js';
+import os from 'node:os';
+import path from 'node:path';
+import { probeDesktop, attachToDesktop } from './win32.js';
 import { Pipeline } from './pipeline.js';
 import { Renderer } from './renderer.js';
 import { selectEncoder } from './encoder-probe.js';
 import { requireVideoDevice } from './devices.js';
 import { buildFilterChain } from './filters.js';
 import { CamToBgError, ErrorCodes } from './errors.js';
+
+/**
+ * 清扫历史崩溃遗留的 sendcmd 命令文件。
+ *
+ * 进程崩溃时 _teardown 不会执行，%TEMP% 里的 cam-to-bg-cmd-*.txt
+ * 会永久残留（每次崩溃漏一个，长期膨胀）。CLI start 会拒绝第二实例，
+ * 因此启动时见到的同前缀文件（含 .tmp）必属历史遗留，可安全删除。
+ *
+ * @param {string} [dir] 目标目录（默认系统临时目录）
+ * @returns {string[]} 被删除的文件名
+ */
+export function sweepStaleCmdFiles(dir) {
+  const base = dir || os.tmpdir();
+  const removed = [];
+  try {
+    for (const name of fs.readdirSync(base)) {
+      if (!name.startsWith('cam-to-bg-cmd-')) continue;
+      try {
+        fs.unlinkSync(path.join(base, name));
+        removed.push(name);
+      } catch { /* 被占用等：跳过，下次再清 */ }
+    }
+  } catch { /* 目录不可读：忽略 */ }
+  return removed;
+}
+
+/**
+ * applyConfig 的参数分类 —— **单一事实源**。
+ *
+ * schema 的 `restart` 标记必须与这里严格等价（test/wallpaper.test.js 有双向
+ * 等价性测试强制），否则会出现两类"说谎"：
+ *   · 标了 restart 却不在分类里 → UI 显示"需重启"、既不弹提示、点了重启也不生效（静默失效）
+ *   · 在分类里却 restart:false → 弹了重启提示、字段却不带"需重启"标记（提示无来源）
+ */
+export const COLOR_KEYS = ['brightness', 'contrast', 'saturation', 'gamma', 'exposure', 'temperature', 'hue'];
+export const GEOMETRY_KEYS = ['flipHorizontal', 'flipVertical', 'rotate', 'scaleMode'];
+export const STRUCTURE_KEYS = [
+  'width', 'height', 'fps', 'device', 'monitor', 'encoder', 'latencyMode',
+  'bitrate', 'quality',
+];
+
+/**
+ * 由桌面探测结果 + monitor 配置解析**编码器实际输入**的输出目标分辨率。
+ *
+ * 关键工况事实：滤镜链无条件 `scale→target`（屏幕分辨率），编码器处理的是
+ * 缩放**后**的帧，而非摄像头采集分辨率（cfg.width/height）。因此编码器探测
+ * 必须按 target 工况——否则摄像头 < 屏幕时"按采集分辨率探测通过、
+ * 实际按屏幕分辨率启动失败"（与录制路径同源的工况脱节）。
+ *
+ * 壁纸启动与 `c2b probe` 必须共用本函数，否则 probe 结论 ≠ 启动所用
+ * （显示器选择逻辑漂移 → 缓存签名也不同）。
+ *
+ * @param {{monitors?:Array<{width:number,height:number,primary?:boolean}>}} desktop probeDesktop 结果
+ * @param {number|string} monitorIdx cfg.monitor（显示器序号）
+ * @param {{width:number,height:number}} fallback 探测失败时的回退尺寸
+ * @returns {{width:number,height:number,monitor:object|null}}
+ */
+export function resolveOutputTarget(desktop, monitorIdx, fallback) {
+  const raw = desktop?.monitors || [];
+  // 主屏必须固定在下标 0：SCHEMA 契约 "monitor 0=主显示器"，而
+  // EnumDisplayMonitors 的枚举顺序**不保证主屏在首位**也不稳定。
+  // 不排序则默认 monitor:0 会落到"枚举到的第一个"（可能是副屏）→ 输出画幅
+  // 用副屏分辨率缩放、壁纸却固定挂主屏 → 尺寸/比例不匹配。
+  // Array.sort 稳定：副屏组保持原有枚举相对顺序。
+  const monitors = raw.slice().sort((a, b) => (a.primary ? 0 : 1) - (b.primary ? 0 : 1));
+  const idx = Number(monitorIdx) || 0;
+  const mon = monitors[idx] || monitors.find((m) => m.primary) || monitors[0];
+  if (mon) return { width: mon.width, height: mon.height, monitor: mon };
+  return { width: fallback.width, height: fallback.height, monitor: null };
+}
 
 export class WallpaperEngine extends EventEmitter {
   /**
@@ -47,6 +119,15 @@ export class WallpaperEngine extends EventEmitter {
 
     /** 与摄像头协商后实际生效的采集格式（可能与用户请求不同）。 */
     this.effectiveCapture = null;
+
+    /**
+     * 上一次下发给 ffmpeg 的**用户原始采集意图**（raw，非协商结果）。
+     * 重启时判断"用户到底改没改采集参数"必须拿它当基准：
+     * 协商过的设备 effectiveCapture 与 requested 天然不等，
+     * 拿 effective 比会把每次重启都误判成"用户改了"→ 回退到设备不支持的
+     * 原始值 → 重启永远失败（真实缺陷，见 restart() 注释）。
+     */
+    this._lastRequestedCapture = null;
 
     /**
      * sendcmd 命令文件。
@@ -84,12 +165,9 @@ export class WallpaperEngine extends EventEmitter {
 
   /** 计算目标输出分辨率（取选中显示器的分辨率）。 */
   _resolveTarget() {
-    const monitors = this.desktop?.monitors || [];
-    const idx = Number(this.config.monitor) || 0;
-    const mon = monitors[idx] || monitors.find((m) => m.primary) || monitors[0];
-    if (mon) return { width: mon.width, height: mon.height, monitor: mon };
-    // 探测失败时回退到配置值
-    return { width: this.config.width, height: this.config.height, monitor: null };
+    return resolveOutputTarget(this.desktop, this.config.monitor, {
+      width: this.config.width, height: this.config.height,
+    });
   }
 
   /**
@@ -130,24 +208,39 @@ export class WallpaperEngine extends EventEmitter {
     // dshow 会报 "Could not set video options" 而整个管线启动失败。
     // 因此这里先问设备支持什么，再挑一个最接近的。
     await this._negotiateCaptureFormat();
+    // 记录本轮的原始采集意图（重启判断"用户是否改参数"的基准）
+    this._lastRequestedCapture = {
+      width: this.config.width, height: this.config.height, fps: this.config.fps,
+    };
 
     // 3) 编码器（已探测过则复用，避免每次重启都重新实测）
     if (!this.encoder) {
       this._log('探测硬件编码器…');
-      if (this.config.encoder && this.config.encoder !== 'auto') {
-        const { ENCODER_CANDIDATES } = await import('./encoder-probe.js');
-        const chosen = ENCODER_CANDIDATES.find((e) => e.name === this.config.encoder);
-        this.encoder = chosen || (await selectEncoder(this.ffmpegPath, { onLog: (m) => this._log(m) })).encoder;
-      } else {
-        const r = await selectEncoder(this.ffmpegPath, { onLog: (m) => this._log(m) });
-        this.encoder = r.encoder;
-      }
+      const prefer = this.config.encoder && this.config.encoder !== 'auto'
+        ? this.config.encoder
+        : undefined;
+      // 关键：**用户指定的编码器也要真实测试**（历史缺陷：直接 find 后使用、
+      // 跳过实测，坏了只能整条管线报错，也没有回退）。
+      // 工况按 **target（滤镜链缩放后的屏幕分辨率）**——编码器实际输入的是
+      // scale 后的帧，非摄像头采集分辨率；按采集分辨率探测会"小尺寸通过、
+      // 实际屏幕分辨率启动失败"（同录制路径的工况脱节）。
+      const r = await selectEncoder(this.ffmpegPath, {
+        prefer,
+        onLog: (m) => this._log(m),
+        width: target.width,
+        height: target.height,
+        bitrate: this.config.bitrate,
+      });
+      this.encoder = r.encoder;
     }
     this._log(`编码器: ${this.encoder.name} (${this.encoder.label})`);
 
     // 3.5) 创建 sendcmd 命令文件，写入当前色彩参数
     //      ffmpeg 启动时通过 sendcmd=f=<路径> 读取此文件，
     //      运行期改色彩参数只更新这个文件，不重启 ffmpeg
+    //      （先清扫历史崩溃遗留的旧文件，见 sweepStaleCmdFiles）
+    const swept = sweepStaleCmdFiles();
+    if (swept.length) this._log(`清理遗留 sendcmd 文件 ${swept.length} 个`);
     this.cmdFilePath = await this._writeCmdFile();
 
     // 4) 先起 ffmpeg（它负责监听端口），再起 mpv 去连
@@ -155,36 +248,22 @@ export class WallpaperEngine extends EventEmitter {
       ffmpegPath: this.ffmpegPath,
       config: this._pipelineConfig(),
       encoder: this.encoder,
-      deviceName: this.device.name,
+      deviceName: this.device.openAs || this.device.name,
+      deviceLabel: this.device.name,
       target,
       cmdFileName: this.cmdFileName,
       cmdDir: this.cmdDir,
       runDir: this.runDir,
     });
     this.pipeline.on('log', (m) => this._log(m));
-    this.pipeline.on('exit', (info) => {
-      this._log(`ffmpeg 已退出 code=${info.code}`);
-      this.emit('pipeline-exit', info);
-    });
+    this.pipeline.on('exit', (info) => this._onPipelineCrash(info));
 
     this._log('启动 ffmpeg 采集与编码…');
     const { url } = await this.pipeline.start();
     this._log(`视频流地址: ${url}`);
-
-    // 5) mpv 渲染并嵌入桌面
-    this.renderer = new Renderer({
-      mpvPath: this.mpvPath,
-      streamUrl: url,
-      config: this.config,
-      runDir: this.runDir,
-    });
-    this.renderer.on('exit', (info) => {
-      this._log(`mpv 已退出 code=${info.code}`);
-      this.emit('renderer-exit', info);
-    });
-
-    this._log('启动 mpv 渲染…');
-    await this.renderer.start({ hwnd: 0 });
+    // 5) mpv 渲染并嵌入桌面（不与 ffmpeg 自检窗并行：就绪探测三难实测
+    //    见 pipeline.start 注释——连接即死/只读探测不可靠/mpv 无重试）
+    await this._startRenderer(url);
 
     // 取 mpv 的窗口句柄：mpv 用 --wid=0 时会创建自己的窗口，
     // 需要由 PowerShell 按窗口标题找到它。
@@ -196,12 +275,19 @@ export class WallpaperEngine extends EventEmitter {
       const res = await attachToDesktop(this.mpvHwnd);
       this.attached = true;
       this._log(`挂载完成，模式=${res.mode}`);
-      if (res.mode === 'progman-fallback') {
-        this._log('警告：未找到壁纸层 WorkerW，已回退挂到 Progman 下（桌面图标可能被遮挡）。');
-      }
+      this._warnAttachMode(res.mode);
     } else {
-      this._log('警告：未能定位 mpv 窗口，画面可能不会出现在桌面上。');
+      // 定位失败绝不能继续：未挂载的 mpv 是一个裸浮在桌面前面的顶层窗口，
+      // 用户只能手动去关。宁可启动失败，也不留浮窗。
+      throw new CamToBgError('未能定位 mpv 窗口，放弃挂载', {
+        code: ErrorCodes.RENDER_FAILED,
+        hint: 'mpv 可能未成功创建窗口，详情见 mpv 日志。',
+      });
     }
+
+    // 存活终检：找窗口/挂载的秒级窗口里任一侧死掉都不能宣布成功，
+    // 否则 state=running 说谎（崩溃已在 _onXxxCrash 记录，但状态需一致）
+    this._assertBringUpAlive();
 
     this.startedAt = Date.now();
     return this.status();
@@ -209,8 +295,25 @@ export class WallpaperEngine extends EventEmitter {
 
   async start() {
     if (this.state === 'running') return this.status();
+    // 并发守卫：启动/重启流程进行中禁止再次 start。
+    // 摄像头是排他资源，并发 bring-up 会互相抢设备、堆积僵死 ffmpeg
+    //（与 restart 的 409 守卫同族；历史上 start 无守卫，可从状态机绕过）。
+    if (this.state === 'starting' || this.state === 'restarting') {
+      throw new CamToBgError(
+        `引擎正在${this.state === 'starting' ? '启动' : '重启'}，不能并发启动`,
+        { code: ErrorCodes.BUSY, hint: '请等待当前流程结束后再操作。' },
+      );
+    }
     this.state = 'starting';
     this._bindCleanup();
+
+    // 异常残留清理：error 态下旧 mpv/管线可能还活着（崩溃留下的现场），
+    // 若不先清，_bringUp 会直接覆盖引用把它变成孤儿浮窗
+    // ——正是"重启遗留 mpv"的同族缺陷，这里统一收敛。
+    if (this.renderer || this.pipeline || this.attached) {
+      this._log('清理上一轮残留进程…');
+      await this._teardown();
+    }
 
     try {
       const st = await this._bringUp();
@@ -221,6 +324,28 @@ export class WallpaperEngine extends EventEmitter {
       this.state = 'error';
       await this._teardown();
       throw err;
+    }
+  }
+
+  /**
+   * 挂载结果的用户可见告警。
+   *
+   * 历史缺陷：旧代码检查 `progman-fallback` —— win32.ps1 的 attach **从不返回**
+   * 该模式（实际返回 workerw / progman / workerw-small），是永不触发的死分支；
+   * 而真正危险的 `workerw-small`（把视频挂到 136×39 的 helper 窗口 →
+   * 被裁成近乎不可见的一小块，README"踩坑记录1"明确记载）反而没有任何告警，
+   * 用户只看到"挂载完成"却找不到画面。
+   *
+   * - `workerw-small`：必须警告并给出处置建议
+   * - `progman`：Win11 实测的标准路径，正常无需告警
+   * - `workerw`：Win10 经典路径，正常
+   *
+   * @param {string} mode win32.ps1 attach 返回的模式
+   */
+  _warnAttachMode(mode) {
+    if (mode === 'workerw-small') {
+      this._log('警告：只找到小尺寸 WorkerW 宿主，壁纸会被裁成一小块（近乎不可见）。'
+        + '请重启 explorer.exe 后再点「重启」重试。');
     }
   }
 
@@ -241,7 +366,8 @@ export class WallpaperEngine extends EventEmitter {
 
     let formats = [];
     try {
-      formats = await probeDeviceFormats(this.ffmpegPath, this.device.name);
+      // 用 openAs（重名设备为备用名）查询：按显示名查询会命中歧义的第一个
+      formats = await probeDeviceFormats(this.ffmpegPath, this.device.openAs || this.device.name);
     } catch {
       formats = [];
     }
@@ -258,7 +384,11 @@ export class WallpaperEngine extends EventEmitter {
         && Math.abs(f.fps - wanted.fps) < 0.5,
     );
     if (exact) {
-      this._log(`采集格式 ${wanted.width}x${wanted.height}@${wanted.fps}（设备原生支持）`);
+      // 必须记录 effectiveCapture：精确命中也可能与请求值有微差
+      //（设备报 29.97、用户请求 30）——不记的话 ffmpeg 会按请求值 30 去
+      // dshow 匹配模式，匹配不到直接启动失败；记下则按设备原生值下发。
+      this.effectiveCapture = { width: exact.width, height: exact.height, fps: exact.fps };
+      this._log(`采集格式 ${exact.width}x${exact.height}@${exact.fps}（设备原生支持）`);
       return { negotiated: true, format: exact };
     }
 
@@ -294,6 +424,73 @@ export class WallpaperEngine extends EventEmitter {
     this._log(`等待摄像头释放 (${waitMs}ms)…`);
     await new Promise((r) => setTimeout(r, waitMs));
     this._log('摄像头等待完成');
+  }
+
+  /**
+   * 创建并启动 mpv 渲染器（初始启动与并行钩子共用的单元）。
+   * @param {string} url 视频流地址
+   */
+  async _startRenderer(url) {
+    this.renderer = new Renderer({
+      mpvPath: this.mpvPath,
+      streamUrl: url,
+      config: this.config,
+      runDir: this.runDir,
+    });
+    this.renderer.on('exit', (info) => this._onRendererCrash(info));
+    this._log('启动 mpv 渲染…');
+    await this.renderer.start({ hwnd: 0 });
+  }
+
+  /**
+   * 管线**异常**退出（Pipeline 只在非主动停止时才 emit 'exit'）。
+   *
+   * 状态机必须诚实：ffmpeg 死了就不能继续报告 running——历史实现不改状态，
+   * 界面显示"运行中"而壁纸早已冻住，用户无从知道该重启（商用级不可接受）。
+   * 转入 error 后，界面点「重启」走 start 路径（会先清理本崩溃现场）。
+   * 启动/重启过程中（starting/restarting）的崩溃交给该流程自身的
+   * 失败路径收敛，此处不越权改状态。
+   */
+  _onPipelineCrash(info) {
+    this._log(`ffmpeg 异常退出 (code=${info.code})，壁纸已停止更新`);
+    if (this.state === 'running') {
+      this.state = 'error';
+      this.startedAt = null;
+    }
+    this.emit('pipeline-exit', info);
+  }
+
+  /** mpv 异常退出：同 _onPipelineCrash 的状态诚实原则。 */
+  _onRendererCrash(info) {
+    this._log(`mpv 异常退出 (code=${info.code})`);
+    if (this.state === 'running') {
+      this.state = 'error';
+      this.startedAt = null;
+    }
+    this.emit('renderer-exit', info);
+  }
+
+  /**
+   * bring-up/restart 收尾前的存活终检。
+   *
+   * Pipeline/Renderer 各自只在启动瞬间自检（+700ms/+900ms）；此后到
+   * "宣布成功"之间还有找窗口、挂载等秒级窗口，任一侧在此期间死掉都
+   * 不能宣布 running——否则产生 state=running 但管线已亡的"僵尸运行中"。
+   * 抛错后由调用方的失败路径统一转入 error 并清理。
+   */
+  _assertBringUpAlive() {
+    if (!this.pipeline?.running) {
+      throw new CamToBgError('ffmpeg 在启动完成前退出', {
+        code: ErrorCodes.PIPELINE_FAILED,
+        hint: this.pipeline?.recentLog?.(600) || '详情见 ffmpeg 日志',
+      });
+    }
+    if (!this.renderer?.running) {
+      throw new CamToBgError('mpv 在启动完成前退出', {
+        code: ErrorCodes.RENDER_FAILED,
+        hint: this.renderer?.recentLog?.(600) || '详情见 mpv 日志',
+      });
+    }
   }
 
   /**
@@ -408,20 +605,21 @@ export class WallpaperEngine extends EventEmitter {
     const prev = this.requestedConfig;
 
     // 色彩类参数：可以通过 sendcmd 实时调整
-    const colorKeys = ['brightness', 'contrast', 'saturation', 'gamma', 'exposure', 'temperature', 'hue'];
+    const colorKeys = COLOR_KEYS; // 分类常量在模块顶部导出（schema 等价性测试强制一致）
 
     // 几何类参数：无法动态修改，需要手动重启
-    const geometryKeys = ['flipHorizontal', 'flipVertical', 'rotate', 'scaleMode'];
+    const geometryKeys = GEOMETRY_KEYS;
 
     // 结构类参数：需要整条重启。
     //
     // 注意 bitrate 与 quality 也在其中：它们是 ffmpeg 的命令行参数，
     // 无法通过 sendcmd 动态修改。早期版本漏了这两项，导致用户改码率/画质时
     // 既不生效也不提示，属于静默失效，必须归入"需重启"。
-    const structureKeys = [
-      'width', 'height', 'fps', 'device', 'monitor', 'encoder', 'uiPort', 'latencyMode',
-      'bitrate', 'quality',
-    ];
+    //
+    // uiPort **不在**这里：HTTP 服务由 index.js 在配置变更时
+    // 直接 relisten（新端口占用失败会自动回退），与 ffmpeg/mpv 管线无关，
+    // 把它算进"需重启"会让用户白点一次重启。
+    const structureKeys = STRUCTURE_KEYS;
 
     const colorChanged = colorKeys.some((k) => prev[k] !== nextConfig[k]);
     const geomChanged = geometryKeys.some((k) => prev[k] !== nextConfig[k]);
@@ -488,20 +686,35 @@ export class WallpaperEngine extends EventEmitter {
 
     // 1) 停旧 ffmpeg，释放摄像头。mpv 与桌面挂载不动
     const oldRenderer = this.renderer;
-    const oldHwnd = this.mpvHwnd;
-    const oldAttached = this.attached;
     const oldPipeline = this.pipeline;
 
-    if (oldPipeline) {
-      try { await oldPipeline.stop(); } catch { /* 忽略 */ }
-      this.pipeline = null;
-    }
+    // 关键：从"停旧"开始的全部阶段都必须收敛到 state='error'。
+    // 早期实现把停旧/等待摄像头放在 try 之外，一旦 _waitForCameraReady 抛错，
+    // 引擎会永远卡在 'restarting'，面板上表现为"重启中"再也不动。
+    try {
+      if (oldPipeline) {
+        try { await oldPipeline.stop(); } catch { /* 忽略 */ }
+        this.pipeline = null;
+      }
 
-    // 关键：摄像头是排他资源，旧 ffmpeg 被杀后设备不会立即释放。
-    // 若立即起新 ffmpeg 会报 -10054（连接被重置）或 BindToObject 失败。
-    // 这里等待设备真正可用后再继续。
-    this._log('等待摄像头释放…');
-    await this._waitForCameraReady();
+      // 关键：摄像头是排他资源，旧 ffmpeg 被杀后设备不会立即释放。
+      // 若立即起新 ffmpeg 会报 -10054（连接被重置）或 BindToObject 失败。
+      // 这里等待设备真正可用后再继续。
+      this._log('等待摄像头释放…');
+      await this._waitForCameraReady();
+    } catch (err) {
+      this._log(`重启失败: ${err.message}`);
+      if (this.pipeline) {
+        try { await this.pipeline.stop(); } catch { /* 忽略 */ }
+        this.pipeline = null;
+      }
+      if (this.renderer && this.renderer !== oldRenderer) {
+        try { await this.renderer.stop(); } catch { /* 忽略 */ }
+        this.renderer = null;
+      }
+      this.state = 'error';
+      throw err;
+    }
 
     // 2) 起新 ffmpeg
     //
@@ -515,26 +728,41 @@ export class WallpaperEngine extends EventEmitter {
     // 如果用户改了 fps/分辨率，会在 effectiveCapture 基础上用新值尝试，
     // 设备不支持的话 ffmpeg 会报错，但不会卡死系统。
     const savedEffective = this.effectiveCapture;
+    const prev = this._lastRequestedCapture; // 上一轮的用户原始采集意图
     this.effectiveCapture = null;
     try {
-      // 如果配置里改了分辨率/帧率，用新值；否则保持原协商结果
-      if (this.requestedConfig.width !== (savedEffective?.width ?? this.config.width)
-        || this.requestedConfig.height !== (savedEffective?.height ?? this.config.height)
-        || this.requestedConfig.fps !== (savedEffective?.fps ?? this.config.fps)) {
-        // 用户改了采集参数，effectiveCapture 已清空，
+      // 判断"用户是否改了采集参数"必须拿 **requestedConfig vs 上轮原始意图** 比。
+      // 历史缺陷：拿 effectiveCapture 比——协商过的设备两者天然不等，
+      // 每次重启都被误判成"用户改了参数"，清掉协商结果、回退到设备并不
+      // 支持的原始值 → 这类设备的重启**永远失败**。
+      const userChanged = !!prev && (
+        this.requestedConfig.width !== prev.width
+        || this.requestedConfig.height !== prev.height
+        || Number(this.requestedConfig.fps) !== Number(prev.fps)
+      );
+      if (userChanged) {
+        // 用户真改了：effectiveCapture 已清空，
         // _pipelineConfig() 会回退到 config 里的用户设定值
         this._log('采集参数已变更，用新值尝试启动');
       } else {
         // 参数没变，恢复已协商的格式
         this.effectiveCapture = savedEffective;
       }
+      // 无论走哪条分支，本轮意图成为下一次比较的基准
+      this._lastRequestedCapture = {
+        width: this.requestedConfig.width,
+        height: this.requestedConfig.height,
+        fps: this.requestedConfig.fps,
+      };
 
       const target = this._resolveTarget();
       this.pipeline = new Pipeline({
         ffmpegPath: this.ffmpegPath,
         config: this._pipelineConfig(),
         encoder: this.encoder,
-        deviceName: this.device.name,
+        // 打开用 openAs（重名设备=备用名），错误提示用显示名 deviceLabel
+        deviceName: this.device.openAs || this.device.name,
+        deviceLabel: this.device.name,
         target,
         // 必须传入 cmdFile：否则新 ffmpeg 的滤镜链里没有 sendcmd，
         // 重启之后所有色彩调整都会失效（写文件但 ffmpeg 不读）。
@@ -543,16 +771,19 @@ export class WallpaperEngine extends EventEmitter {
         runDir: this.runDir,
       });
       this.pipeline.on('log', (m) => this._log(m));
-      this.pipeline.on('exit', (info) => this.emit('pipeline-exit', info));
+      this.pipeline.on('exit', (info) => this._onPipelineCrash(info));
       this._log('启动新 ffmpeg…');
       const { url } = await this.pipeline.start();
       this._log(`新视频流: ${url}`);
 
-      // 3) 停旧 mpv（流已断），摘旧窗口
+      // 3) 停旧 mpv（流已断）。
+      //
+      // 刻意**不**先 detachFromDesktop：SetParent(0) 会把窗口变回顶层窗口，
+      // 若随后的杀进程只杀掉启动器（mpv.com），孤儿窗口就会以顶层形态
+      // 浮在桌面最前面——正是"重启后遗留一个暂停的 mpv 挡在前面"的成因。
+      // 窗口随进程退出自动销毁；即使进程成为孤儿，Renderer.stop 内部
+      // 还会按窗口标题清扫，孤儿也活不下来。
       if (oldRenderer) {
-        if (oldAttached && oldHwnd) {
-          try { await detachFromDesktop(oldHwnd); } catch { /* 忽略 */ }
-        }
         try { await oldRenderer.stop(); } catch { /* 忽略 */ }
         this.renderer = null;
         this.mpvHwnd = 0;
@@ -566,19 +797,28 @@ export class WallpaperEngine extends EventEmitter {
         config: this.config,
         runDir: this.runDir,
       });
-      this.renderer.on('exit', (info) => {
-        this._log(`mpv 已退出 code=${info.code}`);
-        this.emit('renderer-exit', info);
-      });
+      this.renderer.on('exit', (info) => this._onRendererCrash(info));
       this._log('启动新 mpv…');
       await this.renderer.start({ hwnd: 0 });
       this._log('定位新 mpv 窗口…');
       this.mpvHwnd = await this._findMpvWindow();
-      if (this.mpvHwnd) {
+      if (!this.mpvHwnd) {
+        // 找不到窗口就绝不能继续：否则 mpv 会以未挂载的顶层窗口
+        // 裸浮在桌面前面（不可控、无法交互），用户只能手动去关。
+        throw new CamToBgError('重启后未能定位 mpv 窗口', {
+          code: ErrorCodes.RENDER_FAILED,
+          hint: 'mpv 可能启动异常，详情见 mpv 日志。已停止新 mpv，不会留下浮窗。',
+        });
+      }
+      {
         const res = await attachToDesktop(this.mpvHwnd);
         this.attached = true;
         this._log(`挂载完成，模式=${res.mode}`);
+        this._warnAttachMode(res.mode);
       }
+
+      // 存活终检：找窗口/挂载的秒级窗口里任一侧死掉都不能宣布成功
+      this._assertBringUpAlive();
 
       this.state = 'running';
       this.startedAt = Date.now();
@@ -609,26 +849,28 @@ export class WallpaperEngine extends EventEmitter {
     return { stopped: true };
   }
 
-  /** 内部清理：先摘窗口，再停进程。顺序很重要。 */
+  /**
+   * 内部清理：**先停 ffmpeg，再停 mpv**。
+   *
+   * 顺序依据（真机日志实证）：若先杀 mpv，它断开 TCP 会让 ffmpeg 的
+   * mpegts 写入收到 -10054（连接重置=致命错误）→ ffmpeg 停止消费 →
+   * dshow 实时缓冲堆积刷屏 "too full → frame dropped" → trailer 再报
+   * -10054 的三级级联。先停 ffmpeg 则 muxer 在客户端仍在时立即终止
+   *（TerminateProcess 瞬时，无刷窗窗口），mpv 随后停止看到 EOF，全程干净。
+   * 也不再需要 detach：窗口随进程退出销毁，Renderer.stop 内部还会按
+   * 标题清扫孤儿（见其注释）。
+   */
   async _teardown() {
-    if (this.mpvHwnd && this.attached) {
-      try {
-        await detachFromDesktop(this.mpvHwnd);
-        this._log('已从桌面卸载视频窗口');
-      } catch (err) {
-        this._log(`卸载桌面窗口失败: ${err.message}`);
-      }
-    }
     this.attached = false;
     this.mpvHwnd = 0;
 
-    if (this.renderer) {
-      try { await this.renderer.stop(); } catch { /* 忽略 */ }
-      this.renderer = null;
-    }
     if (this.pipeline) {
       try { await this.pipeline.stop(); } catch { /* 忽略 */ }
       this.pipeline = null;
+    }
+    if (this.renderer) {
+      try { await this.renderer.stop(); } catch { /* 忽略 */ }
+      this.renderer = null;
     }
 
     // 清理 sendcmd 命令文件，避免临时目录长期积累

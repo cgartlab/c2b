@@ -12,6 +12,7 @@
  * 同时维护 <logsDir>/last-run.json，指向最近一次运行，供 status / UI 快速展示。
  */
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -33,17 +34,36 @@ export function makeRunId(date = new Date(), pid = process.pid) {
   const pad = (n) => String(n).padStart(2, '0');
   const stamp = `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_`
     + `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
-  const rand = Math.random().toString(16).slice(2, 6);
+  // crypto 而非 Math.random().toString(16).slice(2,6)：
+  // 后者对 0.5/0.8 这类值只产出 1 位十六进制（runId 尾随机位不足 4，碰撞面变大、
+  // 且与"固定 4 位"的格式契约/校验正则不一致）
+  const rand = crypto.randomBytes(2).toString('hex');
   return `${stamp}_${pid}_${rand}`;
+}
+
+/**
+ * runId 严格校验（API/CLI 边界的路径穿越防线）。
+ *
+ * runId 直接进 `path.join(logsDir(), runId)` ——不校验等于允许
+ * `../` 组合把读取引到 logs 目录之外（HTTP 侧是回环服务，可被其他
+ * 本机页面访问；URL 规范化只是副作用防护，不是契约）。
+ *
+ * 格式：YYYYMMDD_HHMMSS_pid_<1-4位hex>
+ * 尾随机位接受 1-4 位：历史版本 Math.random 实现产出过不足 4 位的真实 runId，
+ * 存量日志不能因此读不到（新生成的一律 4 位）。
+ */
+export function isValidRunId(runId) {
+  return typeof runId === 'string' && /^\d{8}_\d{6}_\d+_[0-9a-f]{1,4}$/i.test(runId);
 }
 
 export function runDir(runId) {
   return path.join(logsDir(), runId);
 }
 
-/** 读取运行 manifest；不存在或损坏返回 null。 */
+/** 读取运行 manifest；不存在、损坏或 runId 非法均返回 null。 */
 export function readRun(runId) {
   try {
+    if (!isValidRunId(runId)) return null;
     const p = path.join(runDir(runId), 'manifest.json');
     if (!fs.existsSync(p)) return null;
     return JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -120,8 +140,15 @@ export function startRun(opts = {}) {
 
 /**
  * 结束一次运行：写入退出码与错误摘要，更新 last-run.json。
+ * @param {string} runId
+ * @param {object} [opts]
+ * @param {number} [opts.exitCode]
+ * @param {Error|null} [opts.error]
+ * @param {string} [opts.note] 收尾方式说明（如"被 cam-to-bg stop 强制结束"）——
+ *   硬杀路径下进程内退出钩子不会执行，由外部收尾进程补写，供事后归因
  */
-export function endRun(runId, { exitCode = 0, error = null } = {}) {
+export function endRun(runId, { exitCode = 0, error = null, note = undefined } = {}) {
+  if (!isValidRunId(runId)) return null; // 非法 runId 不写盘（防把收尾写到 logs 之外）
   const manifestPath = path.join(runDir(runId), 'manifest.json');
   let manifest = readRun(runId) || { runId, startedAt: new Date().toISOString(), pid: process.pid };
   manifest.exitCode = exitCode;
@@ -129,6 +156,7 @@ export function endRun(runId, { exitCode = 0, error = null } = {}) {
   if (error) {
     manifest.errorSummary = summarizeError(error);
   }
+  if (note !== undefined) manifest.stopNote = note;
   writeJson(manifestPath, manifest);
   writeLastRun(manifest);
   return manifest;
@@ -185,6 +213,7 @@ export function cleanupOldRuns(retain = 10) {
 /** 读取某次运行的 JSONL 日志（原始文本），供 CLI/UI 展示。 */
 export function readRunLog(runId, maxBytes = 200000) {
   try {
+    if (!isValidRunId(runId)) return '';
     const p = path.join(runDir(runId), 'run.jsonl');
     if (!fs.existsSync(p)) return '';
     const stat = fs.statSync(p);

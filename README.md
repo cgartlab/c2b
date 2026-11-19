@@ -19,6 +19,9 @@ npm test             # 运行单元测试
 
 启动后设置界面会自动打开：**http://127.0.0.1:5757/**
 
+**本地安全策略**：HTTP/WebSocket 仅接受本机回环来源（`localhost` / `127.0.0.1` / `[::1]`）。
+外源网页的跨源 POST（浏览器级 CSRF）与 WebSocket 升级一律 403；无 Origin 的原生客户端（curl/CLI）不受影响。
+
 按下 `Ctrl+C` 会优雅退出并**还原桌面**，不会留下残留窗口或进程。
 
 ---
@@ -46,7 +49,7 @@ npm test             # 运行单元测试
 
 | 项目 | 实测结果 |
 |---|---|
-| 硬件编码器 | `h264_amf`（AMD 硬件编码），逐个真实编码一帧验证通过 |
+| 硬件编码器 | `h264_amf`（AMD 硬件编码），真实编码一段验证通过，且结果带缓存复验 |
 | 备选编码器 | `h264_mf`、`libx264` 均可作为回退 |
 | 桌面宿主窗口 | **Progman (2560×1440)**，非 WorkerW |
 | mpv 渲染 | `vo=gpu-next` + `gpu-api=d3d11` + `hwdec=auto-safe` |
@@ -99,8 +102,8 @@ mpv 官方的运行期控制方式是 `--input-ipc-server`（命名管道），
 而该选项在 Windows 上只支持命名管道、不支持 TCP。
 
 因此本工具**不依赖 mpv IPC**，改用：
-- 画面类参数（色彩/曝光/缩放）→ 只重启 **ffmpeg**，mpv 与桌面挂载完全不动，画面不闪断
-- 结构类参数（分辨率/帧率/编码器）→ 整条管线重启
+- 画面色彩类参数（亮度/对比度/饱和度/Gamma/曝光/色温/色相）→ 走 `sendcmd` 命令文件，**不重启任何进程**
+- 几何与结构类参数（翻转/旋转/缩放模式/分辨率/帧率/编码器等）→ 保存后点「重启」再生效（见下文"参数变更何时生效"）
 
 **c) PowerShell 5.1 会误读 UTF-8 中文脚本**
 `win32.ps1` 含中文注释且为无 BOM 的 UTF-8。用 `powershell.exe`（5.1）执行会因按 ANSI 解析而报语法错误。
@@ -144,6 +147,23 @@ ffmpeg 的 `eq` 滤镜**不支持** `exposure`，传了会报 `Option not found`
 
 > 兼容性：早期版本的 `mirror` 字段会自动迁移为 `flipHorizontal`，旧配置无需手工修改。
 
+### 录制
+| 参数 | 说明 |
+|---|---|
+| 录制帧率 | 1–60（gdigrab 屏幕采集） |
+| 录制码率 | 目标/上限；**AMF/QSV 录制走画质优先模式、不使用码率** |
+| 录制画质 | 0 最好（0–51）；MF 编码器以码率为准、不使用该项 |
+| 麦克风 | **下拉选择**（重名麦克风以序号区分，第二个用备用名打开）；留空不录音频 |
+| 输出文件夹 | 留空 = 系统「视频」文件夹（按 Windows Known Folder 解析，兼容 OneDrive 重定向），自动创建 |
+
+录制产物为**分片 MP4**（`frag_keyframe+empty_moov`）：进程被强杀也只损失最后一小段、
+**文件始终可播**（修复过普通 MP4 在 Windows 硬杀下 moov 缺失整片不可播的缺陷）；
+停止时仍会先向 stdin 写 `q` 走优雅收尾。文件名含毫秒 + 单调递增，连续录制绝不互相覆盖。
+
+**同一时刻只允许一个录制**：CLI 与界面共用一把跨进程互斥锁（原子 `wx` 创建 + 持有者
+存活判定）。并发的第二路会收到「已有录制正在进行中（CLI 或界面其一）」拒绝（HTTP 409 /
+CLI 非零退出）；上次异常遗留的**陈旧锁**（持有者进程已死）会被自动抢占，不会永久卡死。
+
 ### 色彩
 亮度、对比度、饱和度、Gamma、**曝光**、色温（冷暖）、色相。
 全部通过 ffmpeg 滤镜实时生效，**不需要重启 mpv**，因此画面不会闪断。
@@ -151,27 +171,29 @@ ffmpeg 的 `eq` 滤镜**不支持** `exposure`，传了会报 `Option not found`
 ### 编码
 | 参数 | 说明 |
 |---|---|
-| 码率 (Mbps) | 本地回环带宽与画质 |
-| 编码器 | `auto` 会自动挑选可用的硬件编码器 |
-| 画质 | 越小越好；硬件编码器下映射为 CQ/QP，x264 下为 CRF |
+| 码率 (Mbps) | 码率目标/上限。**AMF(H.264/265) 与 QSV 走画质优先模式、不使用码率** |
+| 编码器 | `auto` 会自动实测挑选可用的硬件编码器（结果缓存，下次启动复验即用） |
+| 画质 | 越小越好（0–51）。映射：x264/x265=CRF、AMF=CQP、NVENC=CQ、QSV=ICQ、MF(壁管)=质量模式 |
+
+> 各编码器的率控参数已逐一对照 `ffmpeg -h encoder=<name>`（本机 ffmpeg 9.0.1 官方选项表）
+> 校准，并用真实编码实验定案（例如实测证明 AMF 在 CBR 下 qp 参数完全无效，故改用 CQP）。
 
 ### 延迟
-| 模式 | 缓冲策略 | 适用场景 |
-|---|---|---|
-| `ultra-low`（默认） | 缓冲 1MiB，关闭解码队列，落后立即丢帧 | 追求最低延迟 |
-| `balanced` | 缓冲 6MiB，允许丢帧 | 折中 |
-| `smooth` | 缓冲 16MiB，禁止丢帧 | 优先画面连续 |
+三档模式**同时调整 mpv 渲染侧与 ffmpeg 编码侧**（编码侧含 B 帧/前瞻/预设档位）：
+| 模式 | mpv 缓冲 | 编码侧（B 帧 / 前瞻） | 适用场景 |
+|---|---|---|---|
+| `ultra-low`（默认） | 1MiB，关解码队列，落后即丢 | `bf=0`、零前瞻、低延迟 tune/preset | 追求最低延迟 |
+| `balanced` | 6MiB，允许丢帧 | `bf=1`、前瞻 8 帧、NVENC p2 | 折中 |
+| `smooth` | 16MiB，禁止丢帧；`video-sync=display-resample` | `bf=2`、前瞻 15 帧、AMF transcoding+high_quality | 优先画面连续 |
 
-延迟优化的具体做法（均已实测生效）：
-- mpv 侧：`--video-sync=desync`、`--untimed=yes`、`--cache=no`、
-  `--demuxer-readahead-secs=0`、`--demuxer-max-bytes=1MiB`（默认是 **150MiB**）、
-  `--vd-queue-enable=no`、`--framedrop=decoder+vo`、`--video-latency-hacks=yes`
-- ffmpeg 侧：`-usage lowlatency`、`-latency 0`、`-preanalysis false`、`-vbaq false`、
-  `-bf 0`（无 B 帧）、`-g` 缩短到 1 秒、`-bufsize` 压到 1 倍码率、
-  `-flush_packets 1`、`-muxdelay 0`、`-muxpreload 0`
-
-其中 **`--video-sync=audio` 是必须改掉的默认值**：
-本管线是 `--no-audio` 的纯视频流，让画面去追一个不存在的音频时钟会导致 mpv 持续缓冲、越积越慢。
+要点（均已实测生效）：
+- mpv 侧：`--cache` 按档位 1/6/16MiB、`--demuxer-readahead-secs` 同步收紧
+  （默认 `demuxer-max_bytes` 是 **150MiB**）；ultra-low 另加 `--vd-queue-enable=no`、
+  `--framedrop=decoder+vo`
+- ffmpeg 侧：`-g` 恒为 1 秒；码率上限 `-bufsize` = 2×码率；`-flush_packets 1`、
+  `-muxdelay 0`、`-muxpreload 0`；`-bf` 与前瞻随档位 0/1/2、8/15 帧递进
+- 纯视频流**不能用 `--video-sync=audio`**（依赖不存在的音频时钟会导致持续缓冲）：
+  ultra-low/balanced 用 `desync`，smooth 用官方 `display-resample`
 
 ---
 
@@ -182,9 +204,14 @@ cam-to-bg start [--no-ui] [--verbose]   # 启动
 cam-to-bg stop                          # 停止并还原桌面
 cam-to-bg status                        # 查看运行状态
 cam-to-bg devices                       # 列出摄像头及其支持格式
+cam-to-bg record                        # 屏幕录制（画面+麦克风 → MP4）
+                                        #   --max-duration <秒>  限制录制时长（安全阀）
+                                        #   录制同样纳入运行会话，日志可用 logs 追溯
 cam-to-bg probe                         # 环境/权限/桌面/编码器检测
 cam-to-bg config                        # 打印当前配置
-cam-to-bg set <键>=<值> ...              # 修改配置
+cam-to-bg set <键>=<值> ...              # 修改配置（实例运行中则经其接口在线应用）
+cam-to-bg logs [runId|--last]           # 查看运行日志与错误摘要
+cam-to-bg help                          # 显示帮助
 ```
 
 ### 环境变量
@@ -219,8 +246,12 @@ cam-to-bg set <键>=<值> ...              # 修改配置
 但需求明确要求"码率可调"，这只有在真正编码的前提下才有意义，
 因此保留了完整的编码管线。若将来需要极致低延迟，可增加一个直通模式作为选项。
 
-**测试**：`npm test` 运行 55 个单元测试，覆盖滤镜图生成、配置校验、dshow 输出解析、mpv 参数构造。
-其中滤镜参数名均已用真实 ffmpeg 验证可被接受。
+**测试**：`npm test` 运行 **300+** 个测试（数量随功能持续增长），覆盖滤镜图与率控参数生成、
+配置校验（步进对齐/浮点噪声/范围夹取）、dshow 输出解析（含帧率区间协商）、mpv 参数构造、
+编码器探测与缓存、录制参数与**真实文件可播放性**、HTTP 契约（异常兜底 500、并发守卫 409、
+端口热切换）、状态机（崩溃收敛、并发启动守卫、pid 复用防护）、UI id 一致性，
+以及用**真实 ffmpeg** 固化的 sendcmd 滤镜链集成测试。
+滤镜与编码参数名均已用 `ffmpeg -h encoder=` 官方选项表逐一核对并真实编码验证。
 
 ---
 
@@ -228,6 +259,12 @@ cam-to-bg set <键>=<值> ...              # 修改配置
 
 - 仅支持 Windows 10/11（依赖桌面窗口机制）；平台适配层已隔离在 `src/win32.js` 与 `scripts/win32.ps1`
 - 切换显示器后需重启管线
+- **多屏：壁纸窗口固定挂载在主屏**（Windows 桌面宿主窗口即主屏大小，第三方方案同样受限）；
+  `monitor` 序号仅决定输出画幅，不代表能把壁纸放到副屏
+- **录制与壁纸共享 GPU**：第 33 轮 A/B 实测（同优先级、录制 45s）——壁纸侧**争抢信号 0 条**
+  （`too full`/`dropping` 行）、录制文件时长完整（44.8s/45s，可解码、无崩溃），
+  当前实现（`rtbufsize=100M` + 逐编码器率控）下**无需给录制进程降优先级**。
+  极端多任务负载下的表现未穷举测试
 - 部分摄像头（如某些 USB 摄像头）的 DirectShow 接口需要管理员权限才能访问
 - 色温调节使用 `colorbalance` 在阴影/中间调/高光上整体偏移红蓝，属于近似实现，非严格的白平衡
 
@@ -235,24 +272,34 @@ cam-to-bg set <键>=<值> ...              # 修改配置
 
 ## 停止时如何确保不留残留
 
-`stop` 命令通过 SIGTERM 通知主进程退出，但**主进程退出不等于子进程已退出** ——
-ffmpeg/mpv 是主进程拉起的，若主进程在其退出前就结束，它们会变成孤儿继续占用摄像头，
-并在桌面上留下一个看不见的窗口。
+**关键事实（本机实测）**：Windows 上跨进程 `kill('SIGTERM')` 是**无条件硬杀**
+（TerminateProcess——目标进程注册的信号处理器**根本不执行**）。"发个信号让主进程
+优雅退出"这条路走不通，因此 `stop` 分三层：
 
-因此 `stop` 会在发信号**之前**先记下子进程，主进程退出后按两条依据清理：
-
-1. 按**父进程 pid** 查找 ffmpeg/mpv（最准确）
-2. 用 `state.json` 里记录的子进程 pid 兜底（覆盖父子关系已断的情况）
+1. **HTTP `shutdown`（优雅首选）**：让目标进程**自己**执行完整关停——
+   还原桌面 → 停录制 → 状态/清单/日志收尾。过渡态（启动/重启进行中）会返回 409，
+   `stop` 轮询等它结束再重新请求。
+2. **硬杀兜底**：无界面实例（拿不到 UI 端口）或优雅超时 → 强杀；
+   发信号**之前**先记下子进程，主进程退出后按两条依据清理：
+   1. 按**父进程 pid** 查找 ffmpeg/mpv（最准确）
+   2. 用 `state.json` 里记录的子进程 pid 兜底（覆盖父子关系已断的情况）
+3. **清单补写**：硬杀路径下目标进程的 `process.on('exit')` 钩子**不会执行**
+   （TerminateProcess 没有退出回调），`stop` 会按 `state.runId` 补写 manifest 的
+   `stopNote`（"经外部信号强制结束…"），`c2b logs` 事后可归因。
 
 **清理范围严格限定**，绝不按进程名全量匹配 ——
 否则会误杀你自己另外启动的 ffmpeg/mpv（例如别的转码、录屏任务）。
+兜底路径还带 **pid 复用防护**：state 记录的 pid 可能已被系统分配给无关进程，
+发信号/强杀前会核验进程身份（主进程对表**进程创建时刻**、子进程核对**进程名**），
+对不上则跳过并说明原因——绝不向无辜进程动手。
 
 `stop` 的最终输出会明确告知清理了几个进程。
 
 ### 录制中的停止
 
-录制是一条独立的 ffmpeg 进程。退出时会**先停止录制**再关闭服务，
-以确保 MP4 的尾部（moov）被正确写入 —— 否则录出来的文件无法播放。
+录制是一条独立的 ffmpeg 进程。退出时会**先停止录制**再关闭服务。
+停止采用「先优雅（stdin 写 `q`）→ taskkill → 硬杀」三级策略；
+即便走到硬杀，**分片 MP4 也保证文件可播**（见上文"录制"一节）。
 
 ---
 
@@ -262,7 +309,12 @@ ffmpeg/mpv 是主进程拉起的，若主进程在其退出前就结束，它们
 |---|---|---|
 | **色彩** | 亮度、对比度、饱和度、Gamma、曝光、色温、色相 | **即时生效**（sendcmd 命令文件，不重启任何进程） |
 | **几何** | 水平/垂直翻转、旋转、缩放模式 | 保存后需点「重启」 |
-| **结构** | 帧率、采集分辨率、摄像头、编码器、**码率、画质**、延迟模式、界面端口 | 保存后需点「重启」 |
+| **结构** | 帧率、采集分辨率、摄像头、编码器、**码率、画质**、延迟模式 | 保存后需点「重启」 |
+| **界面端口** | uiPort | **立即生效**（HTTP 服务热切换端口；新端口被占用或属浏览器禁止端口时自动回退并提示） |
+| **日志/其他** | logLevel、logRetainRuns | **立即生效**（运行期切日志级别 / 即时清理超额旧日志）；`openUiOnStart` 仅影响下次启动 |
+
+> 过渡态（启动/重启进行中）保存设置会被 409 拒绝并保留编辑——
+> 否则改动会被在途流程静默吞掉、且没有"需重启"提示。
 
 色彩参数走 ffmpeg 的 `sendcmd` 滤镜：ffmpeg 启动时滤镜链就固定包含
 `sendcmd + eq + exposure + colorbalance + hue`，运行期只改写命令文件内容，
@@ -346,11 +398,13 @@ Error parsing a filter description
 cam-to-bg logs                      # 列出所有运行（含错误标记）
 cam-to-bg logs --last               # 查看最近一次运行详情
 cam-to-bg logs <runId>              # 查看指定运行
-cam-to-bg status                    # 未运行时显示上次运行失败原因
+cam-to-bg status                    # 未运行时显示上次运行失败原因（退出码 0=运行中 / 3=未运行）
 ```
 
-设置界面「高级」区也会显示当前运行 ID 与日志目录；HTTP 端提供
+设置界面「诊断」页签也会显示当前运行 ID 与日志目录；HTTP 端提供
 `/api/logs`（列运行）与 `/api/logs/<runId>`（取 manifest 与日志）。
+`c2b logs <runId>` 详情含退出码、错误摘要，以及强制/看门狗收尾时的
+**停止说明**（`stopNote`，如"经外部信号强制结束…"）便于事后归因。
 
 ### 保留策略
 
@@ -363,18 +417,23 @@ cam-to-bg status                    # 未运行时显示上次运行失败原因
 ```
 src/
   cli.js             命令行入口
+  cli-args.js        argv flag/位置参数分类（纯函数）
   index.js           组装各模块
   wallpaper.js       总控：探测桌面 → 启管线 → 挂载 → 还原
   pipeline.js        ffmpeg 进程生命周期
   renderer.js        mpv 进程与延迟策略
+  recorder.js        屏幕录制（gdigrab + 分片 MP4 + 跨进程互斥锁）
   filters.js         配置 → ffmpeg 滤镜图（纯函数，易测试）
   devices.js         dshow 设备枚举与格式解析
-  encoder-probe.js   真实编码一帧来挑选硬件编码器
+  encoder-probe.js   真实编码一小段（10 帧）来挑选硬件编码器
   win32.js           Node ↔ PowerShell 桥
   server.js          设置界面的 HTTP + WebSocket 服务
   config.js          参数定义、校验与持久化
   logger.js          结构化分级日志器（JSONL）
   runs.js            运行会话管理（目录/manifest/清理/崩溃钩子）
+  errors.js          错误类型与错误码
+  state.js           运行状态存取与 pid 身份核验（防 pid 复用误杀）
+  proc.js            子进程捕获 / 长驻启动 / 日志轮转
   ui/                设置界面（原生 HTML/CSS/JS，无构建步骤）
 scripts/
   win32.ps1          全部 Win32 P/Invoke 调用

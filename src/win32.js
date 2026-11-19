@@ -231,6 +231,27 @@ export async function detachFromDesktop(hwnd) {
   return { child: res.child };
 }
 
+/**
+ * 强杀所有标题精确匹配的窗口及其所属进程。
+ *
+ * 用于清理残留的 mpv 孤儿窗口（SIGTERM 可能只杀死启动器 mpv.com，
+ * 真正的 mpv.exe 会带着窗口活下来，表现为"桌面上遗留一个暂停的播放器"）。
+ * 按窗口标题定位进程，不依赖父子进程关系。
+ *
+ * @param {string} title 窗口标题（精确匹配）
+ * @returns {Promise<{matched:number, killed:number[]}>}
+ */
+export async function closeWindowsByTitle(title) {
+  if (!title) return { matched: 0, killed: [] };
+  try {
+    const res = await runWin32('closewindows', { Title: title });
+    return { matched: res.matched || 0, killed: res.killed || [] };
+  } catch {
+    // 清扫失败不应中断主流程（可能没有残留窗口，也可能环境不允许）
+    return { matched: 0, killed: [] };
+  }
+}
+
 /** 列出显示器。 */
 export async function listMonitors() {
   const res = await runWin32('monitors');

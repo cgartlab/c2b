@@ -3,16 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>摄像头壁纸 · 设置</title>
+<meta name="color-scheme" content="dark">
+<title>C2B · 摄像头壁纸控制台</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <div class="app">
 
+  <!-- 顶栏：品牌 + 状态徽章 + 主操作（吸顶） -->
   <header class="topbar">
     <div class="brand">
-      <span class="dot" id="stateDot"></span>
-      <span class="state-label" id="stateLabel">未启动</span>
+      <span class="logo">C2B</span>
+      <span class="badge" id="stateBadge">
+        <span class="dot" id="stateDot"></span>
+        <span id="stateLabel">未启动</span>
+      </span>
     </div>
     <div class="actions">
       <button id="btnRestart" class="btn btn-primary">重启</button>
@@ -20,54 +25,58 @@
     </div>
   </header>
 
-  <!-- 精简状态条：只显示关键三项 -->
-  <section class="statusbar">
-    <div class="stat"><label>摄像头</label><span id="statDevice">—</span></div>
-    <div class="stat"><label>编码器</label><span id="statEncoder">—</span></div>
-    <div class="stat"><label>运行</label><span id="statUptime">—</span></div>
+  <!-- 关键指标：一眼看清当前跑的是什么 -->
+  <section class="kpis" aria-label="运行概览">
+    <div class="kpi"><span class="kpi-label">摄像头</span><span class="kpi-val" id="statDevice">—</span></div>
+    <div class="kpi"><span class="kpi-label">编码器</span><span class="kpi-val" id="statEncoder">—</span></div>
+    <div class="kpi"><span class="kpi-label">输出分辨率</span><span class="kpi-val" id="statOutput">—</span></div>
+    <div class="kpi"><span class="kpi-label">已运行</span><span class="kpi-val" id="statUptime">—</span></div>
   </section>
 
-  <!-- 录制控制条 -->
-  <section class="rec-bar">
+  <!-- 待重启提示条：有改动未生效时出现，带一键重启 -->
+  <div class="banner" id="restartBanner" hidden role="status">
+    <span class="banner-text" id="bannerText">有改动需重启生效</span>
+    <button id="btnBannerRestart" class="btn btn-primary btn-sm">立即重启</button>
+  </div>
+
+  <!-- 录制控制条：常驻，跨页签可见 -->
+  <section class="rec-bar" aria-label="录制">
     <div class="rec-status" id="recStatus">
       <span class="rec-dot" id="recDot"></span>
       <span id="recLabel">未录制</span>
     </div>
-    <button id="btnRecord" class="btn btn-rec">开始录制</button>
     <span class="rec-time" id="recTime">00:00</span>
+    <button id="btnRecord" class="btn btn-rec">开始录制</button>
   </section>
 
-  <!-- 主控件区：单栏，自动生成 -->
-  <main class="panels" id="panels"></main>
+  <!-- 分区页签：按任务划分，代替无尽的单列长页面 -->
+  <nav class="tabs" id="tabs" role="tablist" aria-label="设置分区"></nav>
 
-  <!-- 高级区：可折叠，默认收起 -->
-  <section class="advanced">
-    <button class="adv-toggle" id="advToggle">高级 ▸</button>
-    <div class="adv-content" id="advContent" hidden>
-      <div class="adv-status">
-        <div class="stat"><label>输出</label><span id="statOutput">—</span></div>
-        <div class="stat"><label>GPU</label><span id="statHw">—</span></div>
-        <div class="stat"><label>PID</label><span id="statPid">—</span></div>
-      </div>
-      <div class="adv-status">
-        <div class="stat"><label>运行 ID</label><span id="statRunId">—</span></div>
-        <div class="stat"><label>日志目录</label><span id="statLogsDir" title="—">—</span></div>
-      </div>
-      <div class="adv-section">
-        <h3>滤镜链</h3>
-        <pre class="preview" id="filterChain">—</pre>
-      </div>
-      <div class="adv-section">
-        <h3>运行日志</h3>
-        <div class="log" id="log"></div>
-      </div>
+  <!-- 页签内容（由 schema 自动生成的控件卡片） -->
+  <main class="panels" id="panels" role="tabpanel"></main>
+
+  <!-- 诊断页签的静态内容 -->
+  <section class="panel adv-panel" id="advPanel" role="tabpanel" hidden>
+    <h2>运行诊断</h2>
+    <div class="adv-grid">
+      <div class="stat-mini"><span class="kpi-label">GPU 加速</span><span id="statHw">—</span></div>
+      <div class="stat-mini"><span class="kpi-label">进程 PID (ffmpeg/mpv)</span><span id="statPid">—</span></div>
+      <div class="stat-mini"><span class="kpi-label">运行 ID</span><span id="statRunId">—</span></div>
+      <div class="stat-mini"><span class="kpi-label">日志目录</span><span id="statLogsDir" title="—">—</span></div>
     </div>
+    <h3>滤镜链</h3>
+    <pre class="preview" id="filterChain">—</pre>
+    <h3>运行日志</h3>
+    <div class="log" id="log" aria-live="polite"></div>
   </section>
 
   <footer class="footer">
-    <span id="saveHint">改动会实时生效</span>
+    <span class="muted">色彩改动即时生效 · 结构改动需重启</span>
     <span class="muted" id="connHint">连接中…</span>
   </footer>
+
+  <!-- 轻提示（toast）：保存/重启反馈，不占用常驻版面 -->
+  <div class="toasts" id="toasts" aria-live="polite"></div>
 </div>
 <script src="/app.js"></script>
 </body>

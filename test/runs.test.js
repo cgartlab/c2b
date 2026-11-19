@@ -28,6 +28,31 @@ function withTempLogs(fn) {
 test('makeRunId 格式为 YYYYMMDD_HHMMSS_pid', () => {
   const id = makeRunId(new Date(2026, 8, 22, 14, 30, 5), 12345);
   assert.match(id, /^20260922_143005_12345_[0-9a-f]{4}$/);
+  // 尾随机位必须恒为 4 位十六进制：历史 Math.random 实现对 0.5/0.8 这类值
+  // 只产出 1 位（与格式契约不一致），改 crypto 后 50 连抽零例外
+  for (let i = 0; i < 50; i += 1) {
+    assert.match(makeRunId(), /^\d{8}_\d{6}_\d+_[0-9a-f]{4}$/, '尾随机位不足 4');
+  }
+});
+
+/* ────── runId 校验：path.join 的路径穿越防线 ────── */
+
+test('isValidRunId：合法通过，穿越/异常形态全部拒绝', async () => {
+  const { isValidRunId, readRun, readRunLog, endRun } = await import('../src/runs.js');
+  assert.equal(isValidRunId('20260922_143005_12345_ab12'), true);
+  assert.equal(isValidRunId('20260922_143005_12345_f'), true, '历史短随机尾（1位）需兼容');
+  // 路径穿越与越界形态
+  for (const bad of [
+    '../../etc', '..\\..\\windows', '/', 'C:\\Windows', '20260922_143005_12345_ab12/../x',
+    '20260922_143005_12345_..', '20260922_143005_12345_abcdef', // 尾超过4位（含 ../.. 变体）
+    '', null, undefined, 42,
+  ]) {
+    assert.equal(isValidRunId(bad), false, `应拒绝: ${String(bad)}`);
+  }
+  // 防线在读写三件套上生效
+  assert.equal(readRun('../../etc'), null);
+  assert.equal(readRunLog('..\\..\\x'), '');
+  assert.equal(endRun('../../etc', { exitCode: 0 }), null);
 });
 
 test('startRun 创建目录并写 manifest', () => {
@@ -113,4 +138,37 @@ test('summarizeError 处理 null 与普通对象', () => {
 
 test('readRun 对不存在或损坏返回 null', () => {
   assert.equal(readRun('不存在的run'), null);
+});
+
+test('endRun 的 note 收尾说明：写入即保留，未传不抹掉（硬杀补写清单用）', () => {
+  withTempLogs(() => {
+    const run = startRun({ config: {} });
+    endRun(run.runId, { exitCode: 0, note: '经外部信号强制结束' });
+    const m = readRun(run.runId);
+    assert.equal(m.exitCode, 0);
+    assert.equal(m.stopNote, '经外部信号强制结束');
+    assert.ok(m.endedAt);
+
+    endRun(run.runId, { exitCode: 0 }); // 二次收尾不传 note
+    assert.equal(readRun(run.runId).stopNote, '经外部信号强制结束', '未传 note 不应抹掉既有说明');
+  });
+});
+
+test('listRuns 透出 stopNote（cmdLogs 列表 / 服务端日志列表的展示依赖它）', () => {
+  withTempLogs(() => {
+    // 强制收尾：endRun 带 note
+    const run = startRun({ config: {} });
+    endRun(run.runId, { exitCode: 0, note: '经外部信号强制结束（Windows 信号为硬杀）' });
+    const first = listRuns()[0];
+    assert.equal(first.runId, run.runId);
+    assert.equal(first.stopNote, '经外部信号强制结束（Windows 信号为硬杀）',
+      'listRuns 必须透出 stopNote，否则 CLI 列表/服务端列表无法展示强制收尾原因');
+
+    // 正常收尾（无 note）不得带 stopNote（不显示噪声）
+    const run2 = startRun({ config: {} });
+    endRun(run2.runId, { exitCode: 0 });
+    assert.equal(listRuns()[0].stopNote, undefined, '正常收尾不写 stopNote');
+    // latestRun 同样走 listRuns → 也应透出
+    assert.equal(latestRun().stopNote, undefined, '刚正常结束的运行无 stopNote');
+  });
 });
